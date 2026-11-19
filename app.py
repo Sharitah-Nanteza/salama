@@ -24,6 +24,21 @@ STUDENTS_DB = {
         "name": "Muwonge Daniel",
         "class": "P.4",
         "parent_phone": "+256700000002"
+    },
+    "STU-003": {
+        "name": "Nakato Faith",
+        "class": "P.5",
+        "parent_phone": "+256700000003"
+    },
+    "STU-004": {
+        "name": "Okello Brian",
+        "class": "P.7",
+        "parent_phone": "+256700000004"
+    },
+    "STU-005": {
+        "name": "Byaruhanga Grace",
+        "class": "P.3",
+        "parent_phone": "+256700000005"
     }
 }
 
