@@ -2,6 +2,7 @@ import os
 from datetime import datetime
 from flask import (
     Flask,
+    Response,
     render_template_string,
     request,
     jsonify,
@@ -29,6 +30,7 @@ STUDENTS_DB = {
         "name": "Namukasa Sarah",
         "class": "P.6",
         "parent_phone": "+256700000001",
+        "preferred_lang": "en",
         "fee_status": "Cleared",
         "fee_balance": 0,
     },
@@ -36,13 +38,15 @@ STUDENTS_DB = {
         "name": "Muwonge Daniel",
         "class": "P.4",
         "parent_phone": "+256700000002",
+        "preferred_lang": "lg",
         "fee_status": "Balance Due",
         "fee_balance": 120000,
     },
     "STU-003": {
-        "name": "Nakato Faith",
+        "name": "Natukunda Faith",
         "class": "P.5",
         "parent_phone": "+256700000003",
+        "preferred_lang": "nyn",
         "fee_status": "Balance Due",
         "fee_balance": 85000,
     },
@@ -50,6 +54,7 @@ STUDENTS_DB = {
         "name": "Okello Brian",
         "class": "P.7",
         "parent_phone": "+256700000004",
+        "preferred_lang": "ach",
         "fee_status": "Cleared",
         "fee_balance": 0,
     },
@@ -57,9 +62,24 @@ STUDENTS_DB = {
         "name": "Byaruhanga Grace",
         "class": "P.3",
         "parent_phone": "+256700000005",
+        "preferred_lang": "nyn",
         "fee_status": "Balance Due",
         "fee_balance": 45000,
     },
+}
+
+LANG_LABELS = {
+    "en": "English",
+    "lg": "Luganda",
+    "nyn": "Runyankole",
+    "ach": "Acholi",
+}
+
+LANG_SHORT = {
+    "en": "EN",
+    "lg": "LG",
+    "nyn": "NYN",
+    "ach": "ACH",
 }
 
 # Stores check-in entries in memory for the live session
@@ -67,6 +87,15 @@ CHECKINS = []
 
 # Maps (YYYY-MM-DD, student_id) -> check-in time string so each student only checks in once per day
 DAILY_CHECKED_IN = {}
+
+# Maps (YYYY-MM-DD, student_id) -> {"time": str, "lang_label": str} when parent reports child sick/excused via USSD
+DAILY_EXCUSED = {}
+
+# Stores parent callback requests made via USSD
+CALLBACK_REQUESTS = []
+
+# Stores absentee roll-call sweep SMS alerts
+ABSENTEE_ALERTS = []
 
 # Toggleable daily fee reminder context for parent check-in SMS
 DASHBOARD_SETTINGS = {
@@ -223,15 +252,17 @@ DASHBOARD_HTML = """
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body { font-family: sans-serif; padding: 20px; background: #f4f7f6; margin: 0; color: #222; }
-        .container { max-width: 960px; margin: auto; }
+        .container { max-width: 1020px; margin: auto; }
         .header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 20px; }
         .header h2 { margin: 0; }
         .actions { display: flex; flex-wrap: wrap; gap: 8px; }
         .actions a, .actions button { padding: 10px 14px; border-radius: 6px; text-decoration: none; font-size: 14px; font-weight: bold; border: none; cursor: pointer; }
         .btn-primary { background: #1976d2; color: white; }
+        .btn-sweep { background: #e65100; color: white; }
         .btn-danger { background: #c62828; color: white; }
         .btn-logout { background: #546e7a; color: white; }
         .btn-sm { padding: 6px 10px; font-size: 12px; border-radius: 5px; border: none; cursor: pointer; font-weight: bold; background: #e3f2fd; color: #1565c0; }
+        .btn-call { padding: 6px 10px; font-size: 12px; border-radius: 5px; border: none; cursor: pointer; font-weight: bold; background: #fff3e0; color: #e65100; }
         .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 20px; }
         .stat-card { background: white; padding: 16px; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); text-align: center; }
         .stat-num { font-size: 26px; font-weight: bold; color: #1976d2; }
@@ -239,7 +270,7 @@ DASHBOARD_HTML = """
         .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.08); margin-bottom: 20px; overflow-x: auto; }
         .toolbar { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 12px; }
         .toggle-box { display: flex; align-items: center; gap: 10px; background: #f8fafc; padding: 10px 14px; border-radius: 8px; border: 1px solid #e2e8f0; }
-        select, input[type="text"] { padding: 8px 10px; border-radius: 6px; border: 1px solid #ccc; font-size: 14px; }
+        select, input[type="text"] { padding: 7px 10px; border-radius: 6px; border: 1px solid #ccc; font-size: 13px; }
         table { width: 100%; border-collapse: collapse; margin-top: 8px; }
         th, td { text-align: left; padding: 11px; border-bottom: 1px solid #eee; font-size: 14px; }
         th { background: #f8fafc; color: #333; }
@@ -247,8 +278,10 @@ DASHBOARD_HTML = """
         .badge-ok { background: #d4edda; color: #155724; }
         .badge-warn { background: #fff3cd; color: #856404; }
         .badge-due { background: #fdecea; color: #b71c1c; }
+        .badge-excused { background: #e0f2f1; color: #00695c; }
+        .badge-lang { background: #ede7f6; color: #4527a0; }
         .empty { text-align: center; color: #666; padding: 20px; }
-        .notice { background: #e8f5e9; color: #1b5e20; padding: 10px 14px; border-radius: 8px; margin-bottom: 14px; font-weight: bold; font-size: 14px; }
+        .notice { background: #e8f5e9; color: #1b5e20; padding: 12px 14px; border-radius: 8px; margin-bottom: 14px; font-weight: bold; font-size: 14px; border-left: 4px solid #2e7d32; }
     </style>
 </head>
 <body>
@@ -256,12 +289,15 @@ DASHBOARD_HTML = """
         <div class="header">
             <div>
                 <h2>Salama Head Teacher Dashboard</h2>
-                <small style="color:#666;">Live attendance, student fees status & parent SMS controls</small>
+                <small style="color:#666;">Live gate attendance, multilingual SMS roll-call alerts, USSD excused absences & parent callbacks</small>
             </div>
             <div class="actions">
-                <a class="btn-primary" href="/dashboard">↻ Refresh Now</a>
-                <form method="POST" action="/admin/clear-checkins" style="display:inline;" onsubmit="return confirm('Clear all test check-in entries?');">
-                    <button type="submit" class="btn-danger">🗑 Clear Test Log</button>
+                <form method="POST" action="/admin/roll-call-sweep" style="display:inline;" onsubmit="return confirm('Send urgent multilingual Absentee Safety SMS alerts for all unexcused missing students?');">
+                    <button type="submit" class="btn-sweep">🚨 Run Morning Roll-Call Sweep</button>
+                </form>
+                <a class="btn-primary" href="/dashboard">↻ Refresh</a>
+                <form method="POST" action="/admin/clear-checkins" style="display:inline;" onsubmit="return confirm('Clear all test logs?');">
+                    <button type="submit" class="btn-danger">🗑 Clear Logs</button>
                 </form>
                 <a class="btn-logout" href="/admin/logout">Logout</a>
             </div>
@@ -281,8 +317,8 @@ DASHBOARD_HTML = """
                 <div class="stat-label">Total Students</div>
             </div>
             <div class="stat-card">
-                <div class="stat-num" id="remaining-count">{{ remaining }}</div>
-                <div class="stat-label">Not Yet Checked In</div>
+                <div class="stat-num" id="remaining-count" style="color:#e65100;">{{ remaining }}</div>
+                <div class="stat-label">Unaccounted For</div>
             </div>
             <div class="stat-card">
                 <div class="stat-num" style="color:#b71c1c;">{{ balance_due_count }}</div>
@@ -346,10 +382,125 @@ DASHBOARD_HTML = """
                 <div class="empty">No check-ins recorded yet. Scan a QR code on the gate device or use Manual Check-In above.</div>
             {% endif %}
         </div>
+
+        <div class="card">
+            <div class="toolbar">
+                <div>
+                    <h3 style="margin:0;">Not Yet Checked In ({{ missing_students|length }})</h3>
+                    <small style="color:#666;">Switch parent SMS language anytime, send a direct safety alert, or view USSD sick/excused reports</small>
+                </div>
+            </div>
+            {% if missing_students %}
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Student</th>
+                            <th>Status</th>
+                            <th>Parent Phone</th>
+                            <th>Preferred Language</th>
+                            <th>Safety Alert Action</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for m in missing_students %}
+                        <tr>
+                            <td><strong>{{ m.name }}</strong> ({{ m.student_id }} · {{ m.class }})</td>
+                            <td>
+                                {% if m.excused %}
+                                    <span class="badge badge-excused">Excused / Sick ({{ m.excused_time }})</span>
+                                {% else %}
+                                    <span class="badge badge-due">Missing</span>
+                                {% endif %}
+                            </td>
+                            <td>{{ m.parent_phone }}</td>
+                            <td>
+                                <form method="POST" action="/admin/set-language" style="display:inline-flex; gap:6px; align-items:center;">
+                                    <input type="hidden" name="student_id" value="{{ m.student_id }}">
+                                    <select name="lang" onchange="this.form.submit()">
+                                        <option value="en" {{ 'selected' if m.preferred_lang == 'en' else '' }}>English</option>
+                                        <option value="lg" {{ 'selected' if m.preferred_lang == 'lg' else '' }}>Luganda</option>
+                                        <option value="nyn" {{ 'selected' if m.preferred_lang == 'nyn' else '' }}>Runyankole</option>
+                                        <option value="ach" {{ 'selected' if m.preferred_lang == 'ach' else '' }}>Acholi</option>
+                                    </select>
+                                </form>
+                            </td>
+                            <td>
+                                <form method="POST" action="/admin/alert-missing-one" style="display:inline;">
+                                    <input type="hidden" name="student_id" value="{{ m.student_id }}">
+                                    <button type="submit" class="btn-call">📩 Send Safety Alert SMS</button>
+                                </form>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            {% else %}
+                <div class="empty">All registered students have checked in today!</div>
+            {% endif %}
+        </div>
+
+        {% if absentee_alerts %}
+        <div class="card">
+            <h3 style="margin-top:0;">Roll-Call Safety Alerts Sent ({{ absentee_alerts|length }})</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Student</th>
+                        <th>Parent Phone</th>
+                        <th>Language</th>
+                        <th>SMS Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for a in absentee_alerts %}
+                    <tr>
+                        <td>{{ a.time }}</td>
+                        <td><strong>{{ a.student_name }}</strong> ({{ a.student_id }} · {{ a.class }})</td>
+                        <td>{{ a.parent_phone }}</td>
+                        <td><span class="badge badge-lang">{{ a.lang_label }}</span></td>
+                        <td><span class="badge badge-ok">{{ a.sms_status }}</span></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
+
+        <div class="card">
+            <h3 style="margin-top:0;">Parent USSD Callback Requests ({{ callbacks|length }})</h3>
+            {% if callbacks %}
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Student</th>
+                            <th>Parent Phone</th>
+                            <th>Language</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for cb in callbacks %}
+                        <tr>
+                            <td>{{ cb.time }}</td>
+                            <td><strong>{{ cb.student_name }}</strong> ({{ cb.student_id }} · {{ cb.class }})</td>
+                            <td>{{ cb.parent_phone }}</td>
+                            <td><span class="badge badge-lang">{{ cb.lang_label }}</span></td>
+                            <td><span class="badge badge-warn">Callback Requested</span></td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            {% else %}
+                <div class="empty">No parent callback requests via USSD yet.</div>
+            {% endif %}
+        </div>
     </div>
 
     <script>
         let latestCheckins = {{ checkins | tojson }};
+        const langShortMap = {{ lang_short | tojson }};
 
         function formatUgx(amount) {
             return "UGX " + Number(amount || 0).toLocaleString();
@@ -379,13 +530,15 @@ DASHBOARD_HTML = """
                     ? `<span class="badge badge-ok">${item.sms_status}</span>`
                     : `<span class="badge badge-warn">${item.sms_status}</span>`;
 
+                const shortCode = langShortMap[item.lang] || 'EN';
+
                 return `
                     <tr>
                         <td>${item.time}</td>
                         <td><strong>${item.name}</strong></td>
                         <td>${item.student_id} · ${item.class}</td>
                         <td>${feeBadge}</td>
-                        <td>${smsBadge}</td>
+                        <td>${smsBadge}<small style="color:#666;"> · ${shortCode}</small></td>
                         <td>
                             <form method="POST" action="/admin/resend-sms" style="display:inline;">
                                 <input type="hidden" name="student_id" value="${item.student_id}">
@@ -429,15 +582,77 @@ def get_today_key(student_id):
     return (today_str, student_id)
 
 
+def find_students_by_parent_phone(phone_number):
+    cleaned = (phone_number or "").strip()
+    return [
+        (sid, info)
+        for sid, info in STUDENTS_DB.items()
+        if info.get("parent_phone", "").strip() == cleaned
+    ]
+
+
 def build_parent_sms_message(student, now_str, include_fee_reminder=False):
+    lang = student.get("preferred_lang", "en")
+    has_balance = student.get("fee_status") == "Balance Due" and student.get("fee_balance", 0) > 0
+    balance_fmt = f"UGX {student.get('fee_balance', 0):,}"
+
+    if lang == "lg":
+        msg = (
+            f"Salama: Omwana wo {student['name']} ({student['class']}) "
+            f"atuuse bulungi ku ssomero ku ssaawa {now_str}."
+        )
+        if include_fee_reminder and has_balance:
+            msg += f" Okujjukiza ku bisale: Obanjibwa {balance_fmt}."
+        return msg
+
+    if lang == "nyn":
+        msg = (
+            f"Salama: Omwana waawe {student['name']} ({student['class']}) "
+            f"ahikire gye aha ishomero shaaha {now_str}."
+        )
+        if include_fee_reminder and has_balance:
+            msg += f" Okwijutsya kw'ebicweka: Oine ebisharwa bya {balance_fmt}."
+        return msg
+
+    if lang == "ach":
+        msg = (
+            f"Salama: Latinni {student['name']} ({student['class']}) "
+            f"oo maber i gang kwan i cawa {now_str}."
+        )
+        if include_fee_reminder and has_balance:
+            msg += f" Wi po me cul: Pwod tye ki cul me {balance_fmt}."
+        return msg
+
     msg = (
         f"Salama Alert: Your child {student['name']} ({student['class']}) "
         f"safely checked in at school at {now_str}."
     )
-    if include_fee_reminder and student.get("fee_status") == "Balance Due" and student.get("fee_balance", 0) > 0:
-        balance_fmt = f"UGX {student['fee_balance']:,}"
+    if include_fee_reminder and has_balance:
         msg += f" Daily Fee Reminder: Outstanding balance is {balance_fmt}."
     return msg
+
+
+def build_absentee_sms_message(student, now_str):
+    lang = student.get("preferred_lang", "en")
+    if lang == "lg":
+        return (
+            f"SALAMA OBUBAKA OBW'AMANGU: Omwana wo {student['name']} ({student['class']}) "
+            f"tannatuuka ku ssomero okutuuka ku ssaawa {now_str}. Kuba ku ssomero oba nyiga *384*42301# okutegeeza."
+        )
+    if lang == "nyn":
+        return (
+            f"SALAMA OKWEJUTSYA KW'OBURINZI: Omwana waawe {student['name']} ({student['class']}) "
+            f"takahikire aha ishomero okuhika shaaha {now_str}. Teerera ishomero ninga oshabe *384*42301#."
+        )
+    if lang == "ach":
+        return (
+            f"SALAMA KWENA ME GWOKO LATIN: Latinni {student['name']} ({student['class']}) "
+            f"peya oo i gang kwan nio i cawa {now_str}. Goy cim i gang kwan onyo di *384*42301#."
+        )
+    return (
+        f"SALAMA SAFETY ALERT: Your child {student['name']} ({student['class']}) "
+        f"has NOT checked in at school as of {now_str}. Contact the school or dial *384*42301# to report an absence."
+    )
 
 
 def send_checkin_sms(student, now_str):
@@ -452,6 +667,31 @@ def send_checkin_sms(student, now_str):
         return "Logged (Sandbox/Check Key)"
 
 
+def trigger_absentee_alert(student_id, student):
+    now_str = datetime.now().strftime("%I:%M:%S %p")
+    lang = student.get("preferred_lang", "en")
+    sms_text = build_absentee_sms_message(student, now_str)
+    try:
+        sms_resp = sms.send(sms_text, [student["parent_phone"]])
+        print("Absentee SMS Response:", sms_resp)
+        sms_status = "Sent"
+    except Exception as e:
+        print("Absentee SMS Error:", e)
+        sms_status = "SMS Error"
+
+    ABSENTEE_ALERTS.insert(0, {
+        "student_id": student_id,
+        "student_name": student["name"],
+        "class": student["class"],
+        "parent_phone": student["parent_phone"],
+        "lang": lang,
+        "lang_label": LANG_LABELS.get(lang, "English"),
+        "sms_status": sms_status,
+        "time": now_str,
+    })
+    return sms_status
+
+
 def try_record_checkin(student_id, student, source="QR Scan"):
     day_key = get_today_key(student_id)
     if day_key in DAILY_CHECKED_IN:
@@ -461,12 +701,14 @@ def try_record_checkin(student_id, student, source="QR Scan"):
     now = datetime.now().strftime("%I:%M:%S %p")
     sms_status = send_checkin_sms(student, now)
     DAILY_CHECKED_IN[day_key] = now
+    DAILY_EXCUSED.pop(day_key, None)
 
     CHECKINS.insert(0, {
         "student_id": student_id,
         "name": student["name"],
         "class": student["class"],
         "parent_phone": student["parent_phone"],
+        "lang": student.get("preferred_lang", "en"),
         "fee_status": student.get("fee_status", "Cleared"),
         "fee_balance": student.get("fee_balance", 0),
         "source": source,
@@ -476,11 +718,33 @@ def try_record_checkin(student_id, student, source="QR Scan"):
     return True, now, sms_status
 
 
+def get_missing_students():
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    missing = []
+    for sid, info in STUDENTS_DB.items():
+        if (today_str, sid) not in DAILY_CHECKED_IN:
+            excused_info = DAILY_EXCUSED.get((today_str, sid))
+            missing.append({
+                "student_id": sid,
+                "name": info["name"],
+                "class": info["class"],
+                "parent_phone": info["parent_phone"],
+                "preferred_lang": info.get("preferred_lang", "en"),
+                "excused": bool(excused_info),
+                "excused_time": excused_info["time"] if excused_info else "",
+            })
+    return missing
+
+
 def build_dashboard_summary():
     total_students = len(STUDENTS_DB)
     today_str = datetime.now().strftime("%Y-%m-%d")
     unique_checked_in = sum(1 for (d, _) in DAILY_CHECKED_IN if d == today_str)
-    remaining = max(total_students - unique_checked_in, 0)
+    unique_excused = sum(
+        1 for (d, sid) in DAILY_EXCUSED
+        if d == today_str and (today_str, sid) not in DAILY_CHECKED_IN
+    )
+    remaining = max(total_students - unique_checked_in - unique_excused, 0)
     balance_due_count = sum(
         1 for s in STUDENTS_DB.values() if s.get("fee_status") == "Balance Due"
     )
@@ -514,6 +778,191 @@ def scan():
 
     success_msg = f"Checked In: {student['name']} ({student['class']}) at {timestamp}."
     return render_template_string(SCANNER_HTML, message=success_msg, status="success")
+
+
+@app.route("/ussd", methods=["POST"])
+def ussd():
+    phone_number = request.form.get("phoneNumber", "").strip()
+    text = request.form.get("text", "").strip()
+    parts = [p for p in text.split("*") if p != ""]
+
+    matches = find_students_by_parent_phone(phone_number)
+    if not matches:
+        return Response(
+            "END Salama: No student linked to this number / Tewali muyizi ku nnamba eno.",
+            mimetype="text/plain",
+        )
+
+    student_id, student = matches[0]
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    checkin_time = DAILY_CHECKED_IN.get((today_str, student_id))
+
+    # Step 1: Language selection
+    if len(parts) == 0:
+        welcome = (
+            "CON Salama Parent Desk\n"
+            "1. English\n"
+            "2. Luganda\n"
+            "3. Runyankole\n"
+            "4. Acholi"
+        )
+        return Response(welcome, mimetype="text/plain")
+
+    lang_map = {
+        "1": "en",
+        "2": "lg",
+        "3": "nyn",
+        "4": "ach",
+    }
+    lang = lang_map.get(parts[0])
+    if not lang:
+        return Response(
+            "END Invalid selection. Please dial again.",
+            mimetype="text/plain",
+        )
+
+    # Persist the parent's chosen language so future SMS alerts match
+    student["preferred_lang"] = lang
+
+    # Step 2: Main menu in chosen language
+    if len(parts) == 1:
+        if lang == "lg":
+            menu = (
+                f"CON Salama ({student['name']} - {student['class']})\n"
+                "1. Okutuuka kw'omwana leero\n"
+                "2. Ebisale by'essomero (Fees)\n"
+                "3. Saba essomero likukubire\n"
+                "4. Tegeeza omwana mulwadde"
+            )
+        elif lang == "nyn":
+            menu = (
+                f"CON Salama ({student['name']} - {student['class']})\n"
+                "1. Okuhika kw'omwana erizooba\n"
+                "2. Ebicweka by'ishomero (Fees)\n"
+                "3. Shaba ishomero rikuteerere\n"
+                "4. Gamba ngu omwana arwaire"
+            )
+        elif lang == "ach":
+            menu = (
+                f"CON Salama ({student['name']} - {student['class']})\n"
+                "1. Tuno pa latin tin\n"
+                "2. Cul me gang kwan (Fees)\n"
+                "3. Penyo me miyo cim\n"
+                "4. Tit ni latin two"
+            )
+        else:
+            menu = (
+                f"CON Salama ({student['name']} - {student['class']})\n"
+                "1. Today's Gate Check-In Status\n"
+                "2. School Fees Balance\n"
+                "3. Request School Callback\n"
+                "4. Report Child Sick / Excused"
+            )
+        return Response(menu, mimetype="text/plain")
+
+    # Step 3: Action response in chosen language
+    action = parts[1]
+    is_cleared = student.get("fee_status") == "Cleared" or student.get("fee_balance", 0) == 0
+    bal = f"UGX {student.get('fee_balance', 0):,}"
+
+    if action == "1":
+        if lang == "lg":
+            res = (
+                f"END {student['name']} ({student['class']}) atuuse ku ssomero leero ku ssaawa {checkin_time}."
+                if checkin_time
+                else f"END {student['name']} ({student['class']}) tannatuuka ku ssomero leero."
+            )
+        elif lang == "nyn":
+            res = (
+                f"END {student['name']} ({student['class']}) ahikire aha ishomero erizooba shaaha {checkin_time}."
+                if checkin_time
+                else f"END {student['name']} ({student['class']}) takahikire aha ishomero erizooba."
+            )
+        elif lang == "ach":
+            res = (
+                f"END {student['name']} ({student['class']}) oo i gang kwan tin i cawa {checkin_time}."
+                if checkin_time
+                else f"END {student['name']} ({student['class']}) peya oo i gang kwan tin."
+            )
+        else:
+            res = (
+                f"END {student['name']} ({student['class']}) checked in today at {checkin_time}."
+                if checkin_time
+                else f"END {student['name']} ({student['class']}) has NOT checked in yet today."
+            )
+        return Response(res, mimetype="text/plain")
+
+    if action == "2":
+        if lang == "lg":
+            res = (
+                f"END {student['name']} ({student['class']}): Ebisale by'essomero byawedde (UGX 0)."
+                if is_cleared
+                else f"END {student['name']} ({student['class']}): Obanjibwa ebisale bya {bal}."
+            )
+        elif lang == "nyn":
+            res = (
+                f"END {student['name']} ({student['class']}): Ebicweka by'ishomero bihendukire (UGX 0)."
+                if is_cleared
+                else f"END {student['name']} ({student['class']}): Oine ebisharwa bya {bal}."
+            )
+        elif lang == "ach":
+            res = (
+                f"END {student['name']} ({student['class']}): Cul me gang kwan otum woko (UGX 0)."
+                if is_cleared
+                else f"END {student['name']} ({student['class']}): Pwod tye ki cul me {bal}."
+            )
+        else:
+            res = (
+                f"END {student['name']} ({student['class']}): School fees are CLEARED (UGX 0)."
+                if is_cleared
+                else f"END {student['name']} ({student['class']}): Fee Balance Due is {bal}."
+            )
+        return Response(res, mimetype="text/plain")
+
+    if action == "3":
+        now_str = datetime.now().strftime("%I:%M:%S %p")
+        CALLBACK_REQUESTS.insert(0, {
+            "student_id": student_id,
+            "student_name": student["name"],
+            "class": student["class"],
+            "parent_phone": phone_number,
+            "lang": lang,
+            "lang_label": LANG_LABELS.get(lang, "English"),
+            "time": now_str,
+        })
+        if lang == "lg":
+            res = f"END Okusaba kwo kuweerezeddwa ku lwa {student['name']}. Essomero lijja kukukubira mangu."
+        elif lang == "nyn":
+            res = f"END Okushaba kwawe kwahika ahabwa {student['name']}. Ishomero niriija kukuteerera bwanyima."
+        elif lang == "ach":
+            res = f"END Penyo ni ocwalo pi {student['name']}. Gang kwan bi goyo cim boti oyot."
+        else:
+            res = f"END Callback requested for {student['name']}. The school office will contact you shortly."
+        return Response(res, mimetype="text/plain")
+
+    if action == "4":
+        now_str = datetime.now().strftime("%I:%M:%S %p")
+        DAILY_EXCUSED[(today_str, student_id)] = {
+            "time": now_str,
+            "lang_label": LANG_LABELS.get(lang, "English"),
+        }
+        if lang == "lg":
+            res = f"END Webale okutegeeza. {student['name']} awandiikiddwa ng'omulwadde/alina olukusa leero."
+        elif lang == "nyn":
+            res = f"END Webare kugamba. {student['name']} yaahandiikwa nk'orwaire erizooba."
+        elif lang == "ach":
+            res = f"END Apwoyo tito. {student['name']} kicoyo ni two / tye ki twero tin."
+        else:
+            res = f"END Thank you. {student['name']} has been marked as Excused (Sick) on the Head Teacher dashboard."
+        return Response(res, mimetype="text/plain")
+
+    invalid_messages = {
+        "lg": "END Ekyalondeddwa tekiriimu. Ddamu okube.",
+        "nyn": "END Eki waatoorana tikiriho. Garuka oteere.",
+        "ach": "END Gin ma i yero pe tye. Tem doki.",
+        "en": "END Invalid selection. Please dial again.",
+    }
+    return Response(invalid_messages.get(lang, invalid_messages["en"]), mimetype="text/plain")
 
 
 @app.route("/admin/login", methods=["GET", "POST"])
@@ -558,6 +1007,56 @@ def toggle_fee_reminder():
     return redirect(url_for("dashboard"))
 
 
+@app.route("/admin/set-language", methods=["POST"])
+def set_student_language():
+    if not is_admin_authenticated():
+        return redirect(url_for("admin_login"))
+    student_id = request.form.get("student_id", "").strip().upper()
+    lang = request.form.get("lang", "en").strip()
+    student = STUDENTS_DB.get(student_id)
+    if student and lang in LANG_LABELS:
+        student["preferred_lang"] = lang
+        session["dashboard_notice"] = f"Updated {student['name']}'s parent SMS language to {LANG_LABELS[lang]}."
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/admin/alert-missing-one", methods=["POST"])
+def alert_missing_one():
+    if not is_admin_authenticated():
+        return redirect(url_for("admin_login"))
+    student_id = request.form.get("student_id", "").strip().upper()
+    student = STUDENTS_DB.get(student_id)
+    if not student:
+        session["dashboard_notice"] = "Student not found."
+        return redirect(url_for("dashboard"))
+    sms_status = trigger_absentee_alert(student_id, student)
+    session["dashboard_notice"] = (
+        f"Absentee Safety SMS dispatched for {student['name']} ({student['parent_phone']}) "
+        f"in {LANG_LABELS.get(student.get('preferred_lang', 'en'), 'English')}: {sms_status}."
+    )
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/admin/roll-call-sweep", methods=["POST"])
+def roll_call_sweep():
+    if not is_admin_authenticated():
+        return redirect(url_for("admin_login"))
+    unexcused_missing = [m for m in get_missing_students() if not m["excused"]]
+    if not unexcused_missing:
+        session["dashboard_notice"] = "Roll-Call Sweep complete: All students are either checked in or excused!"
+        return redirect(url_for("dashboard"))
+
+    for item in unexcused_missing:
+        sid = item["student_id"]
+        trigger_absentee_alert(sid, STUDENTS_DB[sid])
+
+    session["dashboard_notice"] = (
+        f"Morning Roll-Call Sweep complete: Dispatched multilingual Absentee Safety SMS alerts "
+        f"for {len(unexcused_missing)} unaccounted student(s)."
+    )
+    return redirect(url_for("dashboard"))
+
+
 @app.route("/admin/manual-checkin", methods=["POST"])
 def manual_checkin():
     if not is_admin_authenticated():
@@ -596,7 +1095,10 @@ def clear_checkins():
         return redirect(url_for("admin_login"))
     CHECKINS.clear()
     DAILY_CHECKED_IN.clear()
-    session["dashboard_notice"] = "All test check-in entries have been cleared."
+    DAILY_EXCUSED.clear()
+    CALLBACK_REQUESTS.clear()
+    ABSENTEE_ALERTS.clear()
+    session["dashboard_notice"] = "All test check-ins, excused statuses, callback logs, and absentee alerts have been cleared."
     return redirect(url_for("dashboard"))
 
 
@@ -607,6 +1109,10 @@ def render_dashboard():
         DASHBOARD_HTML,
         checkins=CHECKINS,
         students=STUDENTS_DB,
+        missing_students=get_missing_students(),
+        absentee_alerts=ABSENTEE_ALERTS,
+        callbacks=CALLBACK_REQUESTS,
+        lang_short=LANG_SHORT,
         total_students=total_students,
         unique_checked_in=unique_checked_in,
         remaining=remaining,
@@ -630,6 +1136,8 @@ def api_checkins():
     total_students, unique_checked_in, remaining, balance_due_count = build_dashboard_summary()
     return jsonify({
         "checkins": CHECKINS,
+        "callbacks": CALLBACK_REQUESTS,
+        "absentee_alerts": ABSENTEE_ALERTS,
         "total_students": total_students,
         "unique_checked_in": unique_checked_in,
         "remaining": remaining,
