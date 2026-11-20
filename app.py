@@ -1,4 +1,5 @@
 import os
+import sqlite3
 from datetime import datetime
 from flask import (
     Flask,
@@ -21,52 +22,18 @@ app.secret_key = os.getenv("SECRET_KEY", "salama-hackathon-secret-key")
 USERNAME = os.getenv("AT_USERNAME", "sandbox")
 API_KEY = os.getenv("AT_API_KEY")
 ADMIN_NUMBER = os.getenv("ADMIN_NUMBER", "2026")
+DB_PATH = os.getenv("SALAMA_DB_PATH", "salama.db")
 
 africastalking.initialize(USERNAME, API_KEY)
 sms = africastalking.SMS
 
-STUDENTS_DB = {
-    "STU-001": {
-        "name": "Namukasa Sarah",
-        "class": "P.6",
-        "parent_phone": "+256700000001",
-        "preferred_lang": "en",
-        "fee_status": "Cleared",
-        "fee_balance": 0,
-    },
-    "STU-002": {
-        "name": "Muwonge Daniel",
-        "class": "P.4",
-        "parent_phone": "+256700000002",
-        "preferred_lang": "lg",
-        "fee_status": "Balance Due",
-        "fee_balance": 120000,
-    },
-    "STU-003": {
-        "name": "Natukunda Faith",
-        "class": "P.5",
-        "parent_phone": "+256700000003",
-        "preferred_lang": "nyn",
-        "fee_status": "Balance Due",
-        "fee_balance": 85000,
-    },
-    "STU-004": {
-        "name": "Okello Brian",
-        "class": "P.7",
-        "parent_phone": "+256700000004",
-        "preferred_lang": "ach",
-        "fee_status": "Cleared",
-        "fee_balance": 0,
-    },
-    "STU-005": {
-        "name": "Byaruhanga Grace",
-        "class": "P.3",
-        "parent_phone": "+256700000005",
-        "preferred_lang": "nyn",
-        "fee_status": "Balance Due",
-        "fee_balance": 45000,
-    },
-}
+INITIAL_STUDENTS = [
+    ("STU-001", "Namukasa Sarah", "P.6", "+256700000001", "en", "Cleared", 0),
+    ("STU-002", "Muwonge Daniel", "P.4", "+256700000002", "lg", "Balance Due", 120000),
+    ("STU-003", "Natukunda Faith", "P.5", "+256700000003", "nyn", "Balance Due", 85000),
+    ("STU-004", "Okello Brian", "P.7", "+256700000004", "ach", "Cleared", 0),
+    ("STU-005", "Byaruhanga Grace", "P.3", "+256700000005", "nyn", "Balance Due", 45000),
+]
 
 LANG_LABELS = {
     "en": "English",
@@ -82,25 +49,552 @@ LANG_SHORT = {
     "ach": "ACH",
 }
 
-# Stores check-in entries in memory for the live session
-CHECKINS = []
 
-# Maps (YYYY-MM-DD, student_id) -> check-in time string so each student only checks in once per day
-DAILY_CHECKED_IN = {}
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-# Maps (YYYY-MM-DD, student_id) -> {"time": str, "lang_label": str} when parent reports child sick/excused via USSD
-DAILY_EXCUSED = {}
 
-# Stores parent callback requests made via USSD
-CALLBACK_REQUESTS = []
+def init_db():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS students (
+            student_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            class TEXT NOT NULL,
+            parent_phone TEXT NOT NULL,
+            preferred_lang TEXT NOT NULL DEFAULT 'en',
+            fee_status TEXT NOT NULL DEFAULT 'Cleared',
+            fee_balance INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS checkins (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            day_str TEXT NOT NULL,
+            student_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            class TEXT NOT NULL,
+            parent_phone TEXT NOT NULL,
+            lang TEXT NOT NULL,
+            fee_status TEXT NOT NULL,
+            fee_balance INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            time_str TEXT NOT NULL,
+            sms_status TEXT NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS excused_absences (
+            day_str TEXT NOT NULL,
+            student_id TEXT NOT NULL,
+            time_str TEXT NOT NULL,
+            lang_label TEXT NOT NULL,
+            PRIMARY KEY (day_str, student_id)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS callbacks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id TEXT NOT NULL,
+            student_name TEXT NOT NULL,
+            class TEXT NOT NULL,
+            parent_phone TEXT NOT NULL,
+            lang TEXT NOT NULL,
+            lang_label TEXT NOT NULL,
+            time_str TEXT NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS absentee_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id TEXT NOT NULL,
+            student_name TEXT NOT NULL,
+            class TEXT NOT NULL,
+            parent_phone TEXT NOT NULL,
+            lang TEXT NOT NULL,
+            lang_label TEXT NOT NULL,
+            sms_status TEXT NOT NULL,
+            time_str TEXT NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS fee_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id TEXT NOT NULL,
+            student_name TEXT NOT NULL,
+            class TEXT NOT NULL,
+            parent_phone TEXT NOT NULL,
+            amount_paid INTEGER NOT NULL,
+            new_balance INTEGER NOT NULL,
+            lang_label TEXT NOT NULL,
+            time_str TEXT NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
+    cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('daily_fee_reminder', '0')")
 
-# Stores absentee roll-call sweep SMS alerts
-ABSENTEE_ALERTS = []
+    for row in INITIAL_STUDENTS:
+        cur.execute("""
+            INSERT OR IGNORE INTO students
+            (student_id, name, class, parent_phone, preferred_lang, fee_status, fee_balance)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, row)
 
-# Toggleable daily fee reminder context for parent check-in SMS
-DASHBOARD_SETTINGS = {
-    "daily_fee_reminder": False,
-}
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+
+def get_daily_fee_reminder():
+    conn = get_db()
+    row = conn.execute("SELECT value FROM settings WHERE key = 'daily_fee_reminder'").fetchone()
+    conn.close()
+    return bool(row and row["value"] == "1")
+
+
+def set_daily_fee_reminder(enabled):
+    conn = get_db()
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('daily_fee_reminder', ?)",
+        ("1" if enabled else "0",),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_students_dict():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM students ORDER BY student_id").fetchall()
+    conn.close()
+    return {
+        r["student_id"]: {
+            "name": r["name"],
+            "class": r["class"],
+            "parent_phone": r["parent_phone"],
+            "preferred_lang": r["preferred_lang"],
+            "fee_status": r["fee_status"],
+            "fee_balance": int(r["fee_balance"]),
+        }
+        for r in rows
+    }
+
+
+def get_student(student_id):
+    if not student_id:
+        return None
+    conn = get_db()
+    r = conn.execute("SELECT * FROM students WHERE student_id = ?", (student_id,)).fetchone()
+    conn.close()
+    if not r:
+        return None
+    return {
+        "student_id": r["student_id"],
+        "name": r["name"],
+        "class": r["class"],
+        "parent_phone": r["parent_phone"],
+        "preferred_lang": r["preferred_lang"],
+        "fee_status": r["fee_status"],
+        "fee_balance": int(r["fee_balance"]),
+    }
+
+
+def find_student_by_parent_phone(phone_number):
+    cleaned = (phone_number or "").strip()
+    conn = get_db()
+    r = conn.execute("SELECT * FROM students WHERE parent_phone = ?", (cleaned,)).fetchone()
+    conn.close()
+    if not r:
+        return None
+    return {
+        "student_id": r["student_id"],
+        "name": r["name"],
+        "class": r["class"],
+        "parent_phone": r["parent_phone"],
+        "preferred_lang": r["preferred_lang"],
+        "fee_status": r["fee_status"],
+        "fee_balance": int(r["fee_balance"]),
+    }
+
+
+def update_student_language(student_id, lang):
+    conn = get_db()
+    conn.execute(
+        "UPDATE students SET preferred_lang = ? WHERE student_id = ?",
+        (lang, student_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def apply_fee_payment(student_id, amount_paid):
+    conn = get_db()
+    r = conn.execute("SELECT * FROM students WHERE student_id = ?", (student_id,)).fetchone()
+    if not r:
+        conn.close()
+        return None
+
+    current_bal = int(r["fee_balance"])
+    paid = max(0, int(amount_paid))
+    new_bal = max(0, current_bal - paid)
+    new_status = "Cleared" if new_bal == 0 else "Balance Due"
+    now_str = datetime.now().strftime("%I:%M:%S %p")
+    lang_label = LANG_LABELS.get(r["preferred_lang"], "English")
+
+    conn.execute(
+        "UPDATE students SET fee_balance = ?, fee_status = ? WHERE student_id = ?",
+        (new_bal, new_status, student_id),
+    )
+    conn.execute(
+        """
+        INSERT INTO fee_payments
+        (student_id, student_name, class, parent_phone, amount_paid, new_balance, lang_label, time_str)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (student_id, r["name"], r["class"], r["parent_phone"], paid, new_bal, lang_label, now_str),
+    )
+    conn.commit()
+    conn.close()
+
+    return {
+        "student_id": student_id,
+        "name": r["name"],
+        "class": r["class"],
+        "parent_phone": r["parent_phone"],
+        "preferred_lang": r["preferred_lang"],
+        "amount_paid": paid,
+        "new_balance": new_bal,
+        "fee_status": new_status,
+        "time": now_str,
+    }
+
+
+def build_parent_sms_message(student, now_str, include_fee_reminder=False):
+    lang = student.get("preferred_lang", "en")
+    has_balance = student.get("fee_status") == "Balance Due" and student.get("fee_balance", 0) > 0
+    balance_fmt = f"UGX {student.get('fee_balance', 0):,}"
+
+    if lang == "lg":
+        msg = (
+            f"Salama: Omwana wo {student['name']} ({student['class']}) "
+            f"atuuse bulungi ku ssomero ku ssaawa {now_str}."
+        )
+        if include_fee_reminder and has_balance:
+            msg += f" Okujjukiza ku bisale: Obanjibwa {balance_fmt}."
+        return msg
+
+    if lang == "nyn":
+        msg = (
+            f"Salama: Omwana waawe {student['name']} ({student['class']}) "
+            f"ahikire gye aha ishomero shaaha {now_str}."
+        )
+        if include_fee_reminder and has_balance:
+            msg += f" Okwijutsya kw'ebicweka: Oine ebisharwa bya {balance_fmt}."
+        return msg
+
+    if lang == "ach":
+        msg = (
+            f"Salama: Latinni {student['name']} ({student['class']}) "
+            f"oo maber i gang kwan i cawa {now_str}."
+        )
+        if include_fee_reminder and has_balance:
+            msg += f" Wi po me cul: Pwod tye ki cul me {balance_fmt}."
+        return msg
+
+    msg = (
+        f"Salama Alert: Your child {student['name']} ({student['class']}) "
+        f"safely checked in at school at {now_str}."
+    )
+    if include_fee_reminder and has_balance:
+        msg += f" Daily Fee Reminder: Outstanding balance is {balance_fmt}."
+    return msg
+
+
+def build_absentee_sms_message(student, now_str):
+    lang = student.get("preferred_lang", "en")
+    if lang == "lg":
+        return (
+            f"SALAMA OBUBAKA OBW'AMANGU: Omwana wo {student['name']} ({student['class']}) "
+            f"tannatuuka ku ssomero okutuuka ku ssaawa {now_str}. Kuba ku ssomero oba nyiga *384*42301# okutegeeza."
+        )
+    if lang == "nyn":
+        return (
+            f"SALAMA OKWEJUTSYA KW'OBURINZI: Omwana waawe {student['name']} ({student['class']}) "
+            f"takahikire aha ishomero okuhika shaaha {now_str}. Teerera ishomero ninga oshabe *384*42301#."
+        )
+    if lang == "ach":
+        return (
+            f"SALAMA KWENA ME GWOKO LATIN: Latinni {student['name']} ({student['class']}) "
+            f"peya oo i gang kwan nio i cawa {now_str}. Goy cim i gang kwan onyo di *384*42301#."
+        )
+    return (
+        f"SALAMA SAFETY ALERT: Your child {student['name']} ({student['class']}) "
+        f"has NOT checked in at school as of {now_str}. Contact the school or dial *384*42301# to report an absence."
+    )
+
+
+def build_payment_receipt_sms(payment_info):
+    lang = payment_info.get("preferred_lang", "en")
+    paid_fmt = f"UGX {payment_info['amount_paid']:,}"
+    bal_fmt = f"UGX {payment_info['new_balance']:,}"
+
+    if lang == "lg":
+        return (
+            f"Salama Receipt: Tusimye okusasula {paid_fmt} ku lwa {payment_info['name']} ({payment_info['class']}). "
+            f"Ebisale ebisigadde: {bal_fmt}."
+        )
+    if lang == "nyn":
+        return (
+            f"Salama Receipt: Twaakiira okushashura kwa {paid_fmt} ahabwa {payment_info['name']} ({payment_info['class']}). "
+            f"Ebisharwa ebitsigaire: {bal_fmt}."
+        )
+    if lang == "ach":
+        return (
+            f"Salama Receipt: Wa gamo cul me {paid_fmt} pi {payment_info['name']} ({payment_info['class']}). "
+            f"Cul ma odong: {bal_fmt}."
+        )
+    return (
+        f"Salama Receipt: Payment of {paid_fmt} recorded for {payment_info['name']} ({payment_info['class']}). "
+        f"Remaining balance: {bal_fmt}."
+    )
+
+
+def send_sms_safe(message, phone_number, log_prefix="SMS"):
+    try:
+        response = sms.send(message, [phone_number])
+        print(f"{log_prefix} Response:", response)
+        return "Sent"
+    except Exception as e:
+        print(f"{log_prefix} Error:", e)
+        return "Logged (Sandbox/Check Key)"
+
+
+def send_checkin_sms(student, now_str):
+    include_reminder = get_daily_fee_reminder()
+    message = build_parent_sms_message(student, now_str, include_fee_reminder=include_reminder)
+    base_status = send_sms_safe(message, student["parent_phone"], "Check-In SMS")
+    if base_status == "Sent" and include_reminder and student.get("fee_balance", 0) > 0:
+        return "Sent + Fee Note"
+    return base_status
+
+
+def trigger_absentee_alert(student_id, student):
+    now_str = datetime.now().strftime("%I:%M:%S %p")
+    lang = student.get("preferred_lang", "en")
+    sms_text = build_absentee_sms_message(student, now_str)
+    sms_status = send_sms_safe(sms_text, student["parent_phone"], "Absentee SMS")
+
+    conn = get_db()
+    conn.execute(
+        """
+        INSERT INTO absentee_alerts
+        (student_id, student_name, class, parent_phone, lang, lang_label, sms_status, time_str)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            student_id,
+            student["name"],
+            student["class"],
+            student["parent_phone"],
+            lang,
+            LANG_LABELS.get(lang, "English"),
+            sms_status,
+            now_str,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return sms_status
+
+
+def get_today_checkin_time(student_id):
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    conn = get_db()
+    r = conn.execute(
+        "SELECT time_str FROM checkins WHERE day_str = ? AND student_id = ? ORDER BY id ASC LIMIT 1",
+        (today_str, student_id),
+    ).fetchone()
+    conn.close()
+    return r["time_str"] if r else None
+
+
+def try_record_checkin(student_id, student, source="QR Scan"):
+    existing_time = get_today_checkin_time(student_id)
+    if existing_time:
+        return False, existing_time, None
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    now_str = datetime.now().strftime("%I:%M:%S %p")
+    sms_status = send_checkin_sms(student, now_str)
+
+    conn = get_db()
+    conn.execute("DELETE FROM excused_absences WHERE day_str = ? AND student_id = ?", (today_str, student_id))
+    conn.execute(
+        """
+        INSERT INTO checkins
+        (day_str, student_id, name, class, parent_phone, lang, fee_status, fee_balance, source, time_str, sms_status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            today_str,
+            student_id,
+            student["name"],
+            student["class"],
+            student["parent_phone"],
+            student.get("preferred_lang", "en"),
+            student.get("fee_status", "Cleared"),
+            int(student.get("fee_balance", 0)),
+            source,
+            now_str,
+            sms_status,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return True, now_str, sms_status
+
+
+def get_checkins():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM checkins ORDER BY id DESC").fetchall()
+    conn.close()
+    return [
+        {
+            "student_id": r["student_id"],
+            "name": r["name"],
+            "class": r["class"],
+            "parent_phone": r["parent_phone"],
+            "lang": r["lang"],
+            "fee_status": r["fee_status"],
+            "fee_balance": int(r["fee_balance"]),
+            "source": r["source"],
+            "time": r["time_str"],
+            "sms_status": r["sms_status"],
+        }
+        for r in rows
+    ]
+
+
+def get_callbacks():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM callbacks ORDER BY id DESC").fetchall()
+    conn.close()
+    return [
+        {
+            "student_id": r["student_id"],
+            "student_name": r["student_name"],
+            "class": r["class"],
+            "parent_phone": r["parent_phone"],
+            "lang": r["lang"],
+            "lang_label": r["lang_label"],
+            "time": r["time_str"],
+        }
+        for r in rows
+    ]
+
+
+def get_absentee_alerts():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM absentee_alerts ORDER BY id DESC").fetchall()
+    conn.close()
+    return [
+        {
+            "student_id": r["student_id"],
+            "student_name": r["student_name"],
+            "class": r["class"],
+            "parent_phone": r["parent_phone"],
+            "lang": r["lang"],
+            "lang_label": r["lang_label"],
+            "sms_status": r["sms_status"],
+            "time": r["time_str"],
+        }
+        for r in rows
+    ]
+
+
+def get_fee_payments():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM fee_payments ORDER BY id DESC").fetchall()
+    conn.close()
+    return [
+        {
+            "student_id": r["student_id"],
+            "student_name": r["student_name"],
+            "class": r["class"],
+            "parent_phone": r["parent_phone"],
+            "amount_paid": int(r["amount_paid"]),
+            "new_balance": int(r["new_balance"]),
+            "lang_label": r["lang_label"],
+            "time": r["time_str"],
+        }
+        for r in rows
+    ]
+
+
+def get_missing_students():
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    conn = get_db()
+    students = conn.execute("SELECT * FROM students ORDER BY student_id").fetchall()
+    checked_rows = conn.execute(
+        "SELECT DISTINCT student_id FROM checkins WHERE day_str = ?", (today_str,)
+    ).fetchall()
+    excused_rows = conn.execute(
+        "SELECT student_id, time_str FROM excused_absences WHERE day_str = ?", (today_str,)
+    ).fetchall()
+    conn.close()
+
+    checked_set = {r["student_id"] for r in checked_rows}
+    excused_map = {r["student_id"]: r["time_str"] for r in excused_rows}
+
+    missing = []
+    for s in students:
+        sid = s["student_id"]
+        if sid not in checked_set:
+            excused_time = excused_map.get(sid)
+            missing.append({
+                "student_id": sid,
+                "name": s["name"],
+                "class": s["class"],
+                "parent_phone": s["parent_phone"],
+                "preferred_lang": s["preferred_lang"],
+                "excused": bool(excused_time),
+                "excused_time": excused_time or "",
+            })
+    return missing
+
+
+def build_dashboard_summary():
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    conn = get_db()
+    total_students = conn.execute("SELECT COUNT(*) AS c FROM students").fetchone()["c"]
+    unique_checked_in = conn.execute(
+        "SELECT COUNT(DISTINCT student_id) AS c FROM checkins WHERE day_str = ?", (today_str,)
+    ).fetchone()["c"]
+    unique_excused = conn.execute(
+        """
+        SELECT COUNT(*) AS c FROM excused_absences
+        WHERE day_str = ?
+          AND student_id NOT IN (SELECT DISTINCT student_id FROM checkins WHERE day_str = ?)
+        """,
+        (today_str, today_str),
+    ).fetchone()["c"]
+    balance_due_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM students WHERE fee_status = 'Balance Due' AND fee_balance > 0"
+    ).fetchone()["c"]
+    conn.close()
+
+    remaining = max(total_students - unique_checked_in - unique_excused, 0)
+    return total_students, unique_checked_in, remaining, balance_due_count
+
 
 SCANNER_HTML = """
 <!DOCTYPE html>
@@ -252,7 +746,7 @@ DASHBOARD_HTML = """
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body { font-family: sans-serif; padding: 20px; background: #f4f7f6; margin: 0; color: #222; }
-        .container { max-width: 1020px; margin: auto; }
+        .container { max-width: 1040px; margin: auto; }
         .header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 20px; }
         .header h2 { margin: 0; }
         .actions { display: flex; flex-wrap: wrap; gap: 8px; }
@@ -289,14 +783,14 @@ DASHBOARD_HTML = """
         <div class="header">
             <div>
                 <h2>Salama Head Teacher Dashboard</h2>
-                <small style="color:#666;">Live gate attendance, multilingual SMS roll-call alerts, USSD excused absences & parent callbacks</small>
+                <small style="color:#666;">SQLite persisted · Live attendance, multilingual SMS alerts, USSD excused absences & USSD fee payments</small>
             </div>
             <div class="actions">
                 <form method="POST" action="/admin/roll-call-sweep" style="display:inline;" onsubmit="return confirm('Send urgent multilingual Absentee Safety SMS alerts for all unexcused missing students?');">
                     <button type="submit" class="btn-sweep">🚨 Run Morning Roll-Call Sweep</button>
                 </form>
                 <a class="btn-primary" href="/dashboard">↻ Refresh</a>
-                <form method="POST" action="/admin/clear-checkins" style="display:inline;" onsubmit="return confirm('Clear all test logs?');">
+                <form method="POST" action="/admin/clear-checkins" style="display:inline;" onsubmit="return confirm('Clear today\'s check-ins, excused logs, callbacks, alerts, and payment logs?');">
                     <button type="submit" class="btn-danger">🗑 Clear Logs</button>
                 </form>
                 <a class="btn-logout" href="/admin/logout">Logout</a>
@@ -321,7 +815,7 @@ DASHBOARD_HTML = """
                 <div class="stat-label">Unaccounted For</div>
             </div>
             <div class="stat-card">
-                <div class="stat-num" style="color:#b71c1c;">{{ balance_due_count }}</div>
+                <div class="stat-num" id="balance-due-count" style="color:#b71c1c;">{{ balance_due_count }}</div>
                 <div class="stat-label">Students With Fee Balance</div>
             </div>
         </div>
@@ -438,6 +932,36 @@ DASHBOARD_HTML = """
                 <div class="empty">All registered students have checked in today!</div>
             {% endif %}
         </div>
+
+        {% if fee_payments %}
+        <div class="card">
+            <h3 style="margin-top:0;">Parent USSD Fee Payments ({{ fee_payments|length }})</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Student</th>
+                        <th>Parent Phone</th>
+                        <th>Amount Paid</th>
+                        <th>New Balance</th>
+                        <th>Receipt Lang</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for p in fee_payments %}
+                    <tr>
+                        <td>{{ p.time }}</td>
+                        <td><strong>{{ p.student_name }}</strong> ({{ p.student_id }} · {{ p.class }})</td>
+                        <td>{{ p.parent_phone }}</td>
+                        <td><span class="badge badge-ok">UGX {{ "{:,}".format(p.amount_paid) }}</span></td>
+                        <td>UGX {{ "{:,}".format(p.new_balance) }}</td>
+                        <td><span class="badge badge-lang">{{ p.lang_label }}</span></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
 
         {% if absentee_alerts %}
         <div class="card">
@@ -560,6 +1084,8 @@ DASHBOARD_HTML = """
                 latestCheckins = data.checkins || [];
                 document.getElementById('checked-in-count').textContent = data.unique_checked_in;
                 document.getElementById('remaining-count').textContent = data.remaining;
+                const dueEl = document.getElementById('balance-due-count');
+                if (dueEl) dueEl.textContent = data.balance_due_count;
                 const totalScansEl = document.getElementById('total-scans');
                 if (totalScansEl) totalScansEl.textContent = latestCheckins.length;
                 renderFilteredRows();
@@ -577,180 +1103,6 @@ def is_admin_authenticated():
     return bool(session.get("is_admin"))
 
 
-def get_today_key(student_id):
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    return (today_str, student_id)
-
-
-def find_students_by_parent_phone(phone_number):
-    cleaned = (phone_number or "").strip()
-    return [
-        (sid, info)
-        for sid, info in STUDENTS_DB.items()
-        if info.get("parent_phone", "").strip() == cleaned
-    ]
-
-
-def build_parent_sms_message(student, now_str, include_fee_reminder=False):
-    lang = student.get("preferred_lang", "en")
-    has_balance = student.get("fee_status") == "Balance Due" and student.get("fee_balance", 0) > 0
-    balance_fmt = f"UGX {student.get('fee_balance', 0):,}"
-
-    if lang == "lg":
-        msg = (
-            f"Salama: Omwana wo {student['name']} ({student['class']}) "
-            f"atuuse bulungi ku ssomero ku ssaawa {now_str}."
-        )
-        if include_fee_reminder and has_balance:
-            msg += f" Okujjukiza ku bisale: Obanjibwa {balance_fmt}."
-        return msg
-
-    if lang == "nyn":
-        msg = (
-            f"Salama: Omwana waawe {student['name']} ({student['class']}) "
-            f"ahikire gye aha ishomero shaaha {now_str}."
-        )
-        if include_fee_reminder and has_balance:
-            msg += f" Okwijutsya kw'ebicweka: Oine ebisharwa bya {balance_fmt}."
-        return msg
-
-    if lang == "ach":
-        msg = (
-            f"Salama: Latinni {student['name']} ({student['class']}) "
-            f"oo maber i gang kwan i cawa {now_str}."
-        )
-        if include_fee_reminder and has_balance:
-            msg += f" Wi po me cul: Pwod tye ki cul me {balance_fmt}."
-        return msg
-
-    msg = (
-        f"Salama Alert: Your child {student['name']} ({student['class']}) "
-        f"safely checked in at school at {now_str}."
-    )
-    if include_fee_reminder and has_balance:
-        msg += f" Daily Fee Reminder: Outstanding balance is {balance_fmt}."
-    return msg
-
-
-def build_absentee_sms_message(student, now_str):
-    lang = student.get("preferred_lang", "en")
-    if lang == "lg":
-        return (
-            f"SALAMA OBUBAKA OBW'AMANGU: Omwana wo {student['name']} ({student['class']}) "
-            f"tannatuuka ku ssomero okutuuka ku ssaawa {now_str}. Kuba ku ssomero oba nyiga *384*42301# okutegeeza."
-        )
-    if lang == "nyn":
-        return (
-            f"SALAMA OKWEJUTSYA KW'OBURINZI: Omwana waawe {student['name']} ({student['class']}) "
-            f"takahikire aha ishomero okuhika shaaha {now_str}. Teerera ishomero ninga oshabe *384*42301#."
-        )
-    if lang == "ach":
-        return (
-            f"SALAMA KWENA ME GWOKO LATIN: Latinni {student['name']} ({student['class']}) "
-            f"peya oo i gang kwan nio i cawa {now_str}. Goy cim i gang kwan onyo di *384*42301#."
-        )
-    return (
-        f"SALAMA SAFETY ALERT: Your child {student['name']} ({student['class']}) "
-        f"has NOT checked in at school as of {now_str}. Contact the school or dial *384*42301# to report an absence."
-    )
-
-
-def send_checkin_sms(student, now_str):
-    include_reminder = DASHBOARD_SETTINGS.get("daily_fee_reminder", False)
-    message = build_parent_sms_message(student, now_str, include_fee_reminder=include_reminder)
-    try:
-        response = sms.send(message, [student["parent_phone"]])
-        print("SMS Response:", response)
-        return "Sent + Fee Note" if include_reminder and student.get("fee_balance", 0) > 0 else "Sent"
-    except Exception as e:
-        print("SMS Error:", e)
-        return "Logged (Sandbox/Check Key)"
-
-
-def trigger_absentee_alert(student_id, student):
-    now_str = datetime.now().strftime("%I:%M:%S %p")
-    lang = student.get("preferred_lang", "en")
-    sms_text = build_absentee_sms_message(student, now_str)
-    try:
-        sms_resp = sms.send(sms_text, [student["parent_phone"]])
-        print("Absentee SMS Response:", sms_resp)
-        sms_status = "Sent"
-    except Exception as e:
-        print("Absentee SMS Error:", e)
-        sms_status = "SMS Error"
-
-    ABSENTEE_ALERTS.insert(0, {
-        "student_id": student_id,
-        "student_name": student["name"],
-        "class": student["class"],
-        "parent_phone": student["parent_phone"],
-        "lang": lang,
-        "lang_label": LANG_LABELS.get(lang, "English"),
-        "sms_status": sms_status,
-        "time": now_str,
-    })
-    return sms_status
-
-
-def try_record_checkin(student_id, student, source="QR Scan"):
-    day_key = get_today_key(student_id)
-    if day_key in DAILY_CHECKED_IN:
-        first_time = DAILY_CHECKED_IN[day_key]
-        return False, first_time, None
-
-    now = datetime.now().strftime("%I:%M:%S %p")
-    sms_status = send_checkin_sms(student, now)
-    DAILY_CHECKED_IN[day_key] = now
-    DAILY_EXCUSED.pop(day_key, None)
-
-    CHECKINS.insert(0, {
-        "student_id": student_id,
-        "name": student["name"],
-        "class": student["class"],
-        "parent_phone": student["parent_phone"],
-        "lang": student.get("preferred_lang", "en"),
-        "fee_status": student.get("fee_status", "Cleared"),
-        "fee_balance": student.get("fee_balance", 0),
-        "source": source,
-        "time": now,
-        "sms_status": sms_status,
-    })
-    return True, now, sms_status
-
-
-def get_missing_students():
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    missing = []
-    for sid, info in STUDENTS_DB.items():
-        if (today_str, sid) not in DAILY_CHECKED_IN:
-            excused_info = DAILY_EXCUSED.get((today_str, sid))
-            missing.append({
-                "student_id": sid,
-                "name": info["name"],
-                "class": info["class"],
-                "parent_phone": info["parent_phone"],
-                "preferred_lang": info.get("preferred_lang", "en"),
-                "excused": bool(excused_info),
-                "excused_time": excused_info["time"] if excused_info else "",
-            })
-    return missing
-
-
-def build_dashboard_summary():
-    total_students = len(STUDENTS_DB)
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    unique_checked_in = sum(1 for (d, _) in DAILY_CHECKED_IN if d == today_str)
-    unique_excused = sum(
-        1 for (d, sid) in DAILY_EXCUSED
-        if d == today_str and (today_str, sid) not in DAILY_CHECKED_IN
-    )
-    remaining = max(total_students - unique_checked_in - unique_excused, 0)
-    balance_due_count = sum(
-        1 for s in STUDENTS_DB.values() if s.get("fee_status") == "Balance Due"
-    )
-    return total_students, unique_checked_in, remaining, balance_due_count
-
-
 @app.route("/", methods=["GET"])
 def index():
     return render_template_string(SCANNER_HTML)
@@ -759,7 +1111,7 @@ def index():
 @app.route("/scan", methods=["POST"])
 def scan():
     student_id = request.form.get("student_id", "").strip().upper()
-    student = STUDENTS_DB.get(student_id)
+    student = get_student(student_id)
 
     if not student:
         return render_template_string(
@@ -786,16 +1138,16 @@ def ussd():
     text = request.form.get("text", "").strip()
     parts = [p for p in text.split("*") if p != ""]
 
-    matches = find_students_by_parent_phone(phone_number)
-    if not matches:
+    student = find_student_by_parent_phone(phone_number)
+    if not student:
         return Response(
             "END Salama: No student linked to this number / Tewali muyizi ku nnamba eno.",
             mimetype="text/plain",
         )
 
-    student_id, student = matches[0]
+    student_id = student["student_id"]
     today_str = datetime.now().strftime("%Y-%m-%d")
-    checkin_time = DAILY_CHECKED_IN.get((today_str, student_id))
+    checkin_time = get_today_checkin_time(student_id)
 
     # Step 1: Language selection
     if len(parts) == 0:
@@ -821,7 +1173,7 @@ def ussd():
             mimetype="text/plain",
         )
 
-    # Persist the parent's chosen language so future SMS alerts match
+    update_student_language(student_id, lang)
     student["preferred_lang"] = lang
 
     # Step 2: Main menu in chosen language
@@ -832,7 +1184,8 @@ def ussd():
                 "1. Okutuuka kw'omwana leero\n"
                 "2. Ebisale by'essomero (Fees)\n"
                 "3. Saba essomero likukubire\n"
-                "4. Tegeeza omwana mulwadde"
+                "4. Tegeeza omwana mulwadde\n"
+                "5. Sasula ebisale by'essomero"
             )
         elif lang == "nyn":
             menu = (
@@ -840,7 +1193,8 @@ def ussd():
                 "1. Okuhika kw'omwana erizooba\n"
                 "2. Ebicweka by'ishomero (Fees)\n"
                 "3. Shaba ishomero rikuteerere\n"
-                "4. Gamba ngu omwana arwaire"
+                "4. Gamba ngu omwana arwaire\n"
+                "5. Shashura ebicweka by'ishomero"
             )
         elif lang == "ach":
             menu = (
@@ -848,7 +1202,8 @@ def ussd():
                 "1. Tuno pa latin tin\n"
                 "2. Cul me gang kwan (Fees)\n"
                 "3. Penyo me miyo cim\n"
-                "4. Tit ni latin two"
+                "4. Tit ni latin two\n"
+                "5. Cul cul me gang kwan"
             )
         else:
             menu = (
@@ -856,7 +1211,8 @@ def ussd():
                 "1. Today's Gate Check-In Status\n"
                 "2. School Fees Balance\n"
                 "3. Request School Callback\n"
-                "4. Report Child Sick / Excused"
+                "4. Report Child Sick / Excused\n"
+                "5. Pay School Fees"
             )
         return Response(menu, mimetype="text/plain")
 
@@ -921,15 +1277,26 @@ def ussd():
 
     if action == "3":
         now_str = datetime.now().strftime("%I:%M:%S %p")
-        CALLBACK_REQUESTS.insert(0, {
-            "student_id": student_id,
-            "student_name": student["name"],
-            "class": student["class"],
-            "parent_phone": phone_number,
-            "lang": lang,
-            "lang_label": LANG_LABELS.get(lang, "English"),
-            "time": now_str,
-        })
+        conn = get_db()
+        conn.execute(
+            """
+            INSERT INTO callbacks
+            (student_id, student_name, class, parent_phone, lang, lang_label, time_str)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                student_id,
+                student["name"],
+                student["class"],
+                phone_number,
+                lang,
+                LANG_LABELS.get(lang, "English"),
+                now_str,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
         if lang == "lg":
             res = f"END Okusaba kwo kuweerezeddwa ku lwa {student['name']}. Essomero lijja kukukubira mangu."
         elif lang == "nyn":
@@ -942,10 +1309,17 @@ def ussd():
 
     if action == "4":
         now_str = datetime.now().strftime("%I:%M:%S %p")
-        DAILY_EXCUSED[(today_str, student_id)] = {
-            "time": now_str,
-            "lang_label": LANG_LABELS.get(lang, "English"),
-        }
+        conn = get_db()
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO excused_absences (day_str, student_id, time_str, lang_label)
+            VALUES (?, ?, ?, ?)
+            """,
+            (today_str, student_id, now_str, LANG_LABELS.get(lang, "English")),
+        )
+        conn.commit()
+        conn.close()
+
         if lang == "lg":
             res = f"END Webale okutegeeza. {student['name']} awandiikiddwa ng'omulwadde/alina olukusa leero."
         elif lang == "nyn":
@@ -955,6 +1329,54 @@ def ussd():
         else:
             res = f"END Thank you. {student['name']} has been marked as Excused (Sick) on the Head Teacher dashboard."
         return Response(res, mimetype="text/plain")
+
+    if action == "5":
+        if is_cleared:
+            cleared_msgs = {
+                "lg": f"END {student['name']} talina bbanja lya bisale (UGX 0).",
+                "nyn": f"END {student['name']} taine musharwa gw'ebicweka (UGX 0).",
+                "ach": f"END {student['name']} pe ki cul mo keken (UGX 0).",
+                "en": f"END {student['name']} already has a zero fee balance (UGX 0).",
+            }
+            return Response(cleared_msgs.get(lang, cleared_msgs["en"]), mimetype="text/plain")
+
+        # Step 3a: Prompt parent for payment amount (in UGX)
+        if len(parts) == 2:
+            prompts = {
+                "lg": f"CON Ebisale bya {student['name']}: {bal}.\nYingiza omuwendo gw'osasula (UGX), gamba 50000:",
+                "nyn": f"CON Ebicweka bya {student['name']}: {bal}.\nTaamu sente ezaashashurwa (UGX), nk'50000:",
+                "ach": f"CON Cul pa {student['name']}: {bal}.\nKet wel cente ma i gamo (UGX), calo 50000:",
+                "en": f"CON {student['name']} Fee Balance: {bal}.\nEnter amount to pay (UGX), e.g. 50000:",
+            }
+            return Response(prompts.get(lang, prompts["en"]), mimetype="text/plain")
+
+        # Step 4: Process entered payment amount and send receipt SMS
+        raw_amount = parts[2].replace(",", "").strip()
+        if not raw_amount.isdigit() or int(raw_amount) <= 0:
+            bad_amt = {
+                "lg": "END Omuwendo si mutufu. Ddamu ogezeeko.",
+                "nyn": "END Omuhendo tigurikuhika. Garuka ogezeeko.",
+                "ach": "END Wel cente pe tye atir. Tem doki.",
+                "en": "END Invalid amount. Please dial again and enter a valid UGX amount.",
+            }
+            return Response(bad_amt.get(lang, bad_amt["en"]), mimetype="text/plain")
+
+        payment_info = apply_fee_payment(student_id, int(raw_amount))
+        receipt_sms = build_payment_receipt_sms(payment_info)
+        send_sms_safe(receipt_sms, student["parent_phone"], "Fee Receipt SMS")
+
+        paid_str = f"UGX {payment_info['amount_paid']:,}"
+        rem_str = f"UGX {payment_info['new_balance']:,}"
+
+        if lang == "lg":
+            done_msg = f"END Webale! Okusasula {paid_str} ku lwa {student['name']} kuwandiikiddwa. Ebisale ebisigadde: {rem_str}."
+        elif lang == "nyn":
+            done_msg = f"END Webare! Okushashura kwa {paid_str} ahabwa {student['name']} kwahandiikwa. Ebisharwa ebitsigaire: {rem_str}."
+        elif lang == "ach":
+            done_msg = f"END Apwoyo! Gamo cul me {paid_str} pi {student['name']} kicoyo. Cul ma odong: {rem_str}."
+        else:
+            done_msg = f"END Payment of {paid_str} recorded for {student['name']}. Remaining balance: {rem_str}."
+        return Response(done_msg, mimetype="text/plain")
 
     invalid_messages = {
         "lg": "END Ekyalondeddwa tekiriimu. Ddamu okube.",
@@ -1001,8 +1423,9 @@ def admin_logout():
 def toggle_fee_reminder():
     if not is_admin_authenticated():
         return redirect(url_for("admin_login"))
-    DASHBOARD_SETTINGS["daily_fee_reminder"] = bool(request.form.get("daily_fee_reminder"))
-    state_label = "enabled" if DASHBOARD_SETTINGS["daily_fee_reminder"] else "disabled"
+    enabled = bool(request.form.get("daily_fee_reminder"))
+    set_daily_fee_reminder(enabled)
+    state_label = "enabled" if enabled else "disabled"
     session["dashboard_notice"] = f"Daily fee reminder in parent SMS {state_label}."
     return redirect(url_for("dashboard"))
 
@@ -1013,9 +1436,9 @@ def set_student_language():
         return redirect(url_for("admin_login"))
     student_id = request.form.get("student_id", "").strip().upper()
     lang = request.form.get("lang", "en").strip()
-    student = STUDENTS_DB.get(student_id)
+    student = get_student(student_id)
     if student and lang in LANG_LABELS:
-        student["preferred_lang"] = lang
+        update_student_language(student_id, lang)
         session["dashboard_notice"] = f"Updated {student['name']}'s parent SMS language to {LANG_LABELS[lang]}."
     return redirect(url_for("dashboard"))
 
@@ -1025,7 +1448,7 @@ def alert_missing_one():
     if not is_admin_authenticated():
         return redirect(url_for("admin_login"))
     student_id = request.form.get("student_id", "").strip().upper()
-    student = STUDENTS_DB.get(student_id)
+    student = get_student(student_id)
     if not student:
         session["dashboard_notice"] = "Student not found."
         return redirect(url_for("dashboard"))
@@ -1048,7 +1471,9 @@ def roll_call_sweep():
 
     for item in unexcused_missing:
         sid = item["student_id"]
-        trigger_absentee_alert(sid, STUDENTS_DB[sid])
+        student = get_student(sid)
+        if student:
+            trigger_absentee_alert(sid, student)
 
     session["dashboard_notice"] = (
         f"Morning Roll-Call Sweep complete: Dispatched multilingual Absentee Safety SMS alerts "
@@ -1062,7 +1487,7 @@ def manual_checkin():
     if not is_admin_authenticated():
         return redirect(url_for("admin_login"))
     student_id = request.form.get("student_id", "").strip().upper()
-    student = STUDENTS_DB.get(student_id)
+    student = get_student(student_id)
     if not student:
         session["dashboard_notice"] = f"Could not find student {student_id}."
         return redirect(url_for("dashboard"))
@@ -1079,7 +1504,7 @@ def resend_sms():
     if not is_admin_authenticated():
         return redirect(url_for("admin_login"))
     student_id = request.form.get("student_id", "").strip().upper()
-    student = STUDENTS_DB.get(student_id)
+    student = get_student(student_id)
     if not student:
         session["dashboard_notice"] = "Student record not found."
         return redirect(url_for("dashboard"))
@@ -1093,12 +1518,15 @@ def resend_sms():
 def clear_checkins():
     if not is_admin_authenticated():
         return redirect(url_for("admin_login"))
-    CHECKINS.clear()
-    DAILY_CHECKED_IN.clear()
-    DAILY_EXCUSED.clear()
-    CALLBACK_REQUESTS.clear()
-    ABSENTEE_ALERTS.clear()
-    session["dashboard_notice"] = "All test check-ins, excused statuses, callback logs, and absentee alerts have been cleared."
+    conn = get_db()
+    conn.execute("DELETE FROM checkins")
+    conn.execute("DELETE FROM excused_absences")
+    conn.execute("DELETE FROM callbacks")
+    conn.execute("DELETE FROM absentee_alerts")
+    conn.execute("DELETE FROM fee_payments")
+    conn.commit()
+    conn.close()
+    session["dashboard_notice"] = "Cleared check-ins, excused logs, callbacks, absentee alerts, and payment logs in SQLite."
     return redirect(url_for("dashboard"))
 
 
@@ -1107,17 +1535,18 @@ def render_dashboard():
     total_students, unique_checked_in, remaining, balance_due_count = build_dashboard_summary()
     return render_template_string(
         DASHBOARD_HTML,
-        checkins=CHECKINS,
-        students=STUDENTS_DB,
+        checkins=get_checkins(),
+        students=get_students_dict(),
         missing_students=get_missing_students(),
-        absentee_alerts=ABSENTEE_ALERTS,
-        callbacks=CALLBACK_REQUESTS,
+        absentee_alerts=get_absentee_alerts(),
+        fee_payments=get_fee_payments(),
+        callbacks=get_callbacks(),
         lang_short=LANG_SHORT,
         total_students=total_students,
         unique_checked_in=unique_checked_in,
         remaining=remaining,
         balance_due_count=balance_due_count,
-        daily_fee_reminder=DASHBOARD_SETTINGS.get("daily_fee_reminder", False),
+        daily_fee_reminder=get_daily_fee_reminder(),
         notice=notice,
     )
 
@@ -1135,14 +1564,15 @@ def api_checkins():
         return jsonify({"error": "Unauthorized"}), 401
     total_students, unique_checked_in, remaining, balance_due_count = build_dashboard_summary()
     return jsonify({
-        "checkins": CHECKINS,
-        "callbacks": CALLBACK_REQUESTS,
-        "absentee_alerts": ABSENTEE_ALERTS,
+        "checkins": get_checkins(),
+        "callbacks": get_callbacks(),
+        "absentee_alerts": get_absentee_alerts(),
+        "fee_payments": get_fee_payments(),
         "total_students": total_students,
         "unique_checked_in": unique_checked_in,
         "remaining": remaining,
         "balance_due_count": balance_due_count,
-        "daily_fee_reminder": DASHBOARD_SETTINGS.get("daily_fee_reminder", False),
+        "daily_fee_reminder": get_daily_fee_reminder(),
     })
 
 
